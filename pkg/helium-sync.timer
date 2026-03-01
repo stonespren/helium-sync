@@ -1,0 +1,12 @@
+[Unit]
+Description=Helium Browser Profile Sync Timer
+After=network-online.target
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=SYNC_INTERVAL
+Persistent=true
+RandomizedDelaySec=30
+
+[Install]
+WantedBy=timers.target

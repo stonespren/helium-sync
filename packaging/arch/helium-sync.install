@@ -1,0 +1,22 @@
+post_install() {
+    echo ":: Run 'helium-sync-setup' or '/usr/share/helium-sync/setup.sh' to configure."
+    echo ":: See /usr/share/doc/helium-sync/README.md for documentation."
+}
+
+post_upgrade() {
+    echo ":: helium-sync upgraded. Restart the timer with:"
+    echo "::   systemctl --user restart helium-sync.timer"
+}
+
+pre_remove() {
+    systemctl --user stop helium-sync.timer 2>/dev/null || true
+    systemctl --user disable helium-sync.timer 2>/dev/null || true
+    systemctl --user stop helium-sync.service 2>/dev/null || true
+}
+
+post_remove() {
+    systemctl --user daemon-reload 2>/dev/null || true
+    echo ":: Configuration remains in ~/.config/helium-sync/"
+    echo ":: Logs remain in ~/.local/state/helium-sync/"
+    echo ":: Remove manually if desired."
+}

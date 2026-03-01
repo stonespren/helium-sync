@@ -1,0 +1,41 @@
+# Maintainer: helium-sync maintainers
+pkgname=helium-sync
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Synchronize Helium browser profile data across devices using Amazon S3"
+arch=('x86_64')
+url="https://github.com/helium-sync/helium-sync"
+license=('MIT')
+depends=()
+makedepends=('go')
+optdepends=('aws-cli-v2: for setup script')
+backup=()
+source=("${pkgname}-${pkgver}.tar.gz::${url}/archive/v${pkgver}.tar.gz")
+sha256sums=('SKIP')
+
+build() {
+    cd "${pkgname}-${pkgver}"
+    export CGO_ENABLED=0
+    export GOFLAGS="-buildmode=pie -trimpath"
+    go build -ldflags "-s -w -X main.version=${pkgver}" -o ${pkgname} ./cmd/helium-sync/
+}
+
+package() {
+    cd "${pkgname}-${pkgver}"
+
+    # Binary
+    install -Dm755 "${pkgname}" "${pkgdir}/usr/bin/${pkgname}"
+
+    # Systemd user units
+    install -Dm644 pkg/helium-sync.service "${pkgdir}/usr/lib/systemd/user/helium-sync.service"
+    install -Dm644 pkg/helium-sync.timer "${pkgdir}/usr/lib/systemd/user/helium-sync.timer"
+
+    # Setup script
+    install -Dm755 scripts/setup.sh "${pkgdir}/usr/share/${pkgname}/setup.sh"
+
+    # License
+    install -Dm644 LICENSE "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+
+    # README
+    install -Dm644 README.md "${pkgdir}/usr/share/doc/${pkgname}/README.md"
+}

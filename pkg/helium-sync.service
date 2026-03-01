@@ -1,0 +1,15 @@
+[Unit]
+Description=Helium Browser Profile Sync
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/helium-sync sync --background
+Nice=19
+IOSchedulingClass=idle
+MemoryMax=100M
+CPUQuota=25%
+
+[Install]
+WantedBy=default.target
