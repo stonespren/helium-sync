@@ -191,8 +191,9 @@ func (e *Engine) SyncProfile(ctx context.Context, prof profile.Profile, interact
 			}
 			conflictChoice = choice
 		} else {
-			// Background: newer timestamp wins
-			if remoteManifest.LastSyncTimestamp.After(time.Now().UTC().Add(-time.Second)) {
+			// Background: newer last_sync_timestamp wins (last-writer-wins)
+			localLastSync, _ := GetLastSyncTime(prof.Name)
+			if remoteManifest.LastSyncTimestamp.After(localLastSync) {
 				conflictChoice = ChoiceKeepRemote
 			} else {
 				conflictChoice = ChoiceKeepLocal
