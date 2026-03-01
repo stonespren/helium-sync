@@ -1,6 +1,6 @@
 # Maintainer: stonespren
 pkgname=helium-sync
-pkgver=0.2.1
+pkgver=0.3.0
 pkgrel=1
 pkgdesc="Synchronize Helium browser profile data across devices using Amazon S3"
 arch=('x86_64')
