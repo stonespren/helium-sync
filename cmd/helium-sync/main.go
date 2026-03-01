@@ -40,6 +40,7 @@ via systemd timer and manual control via CLI.`,
 		newConfigCmd(),
 		newLogsCmd(),
 		newStatusCmd(),
+		newSetupCmd(),
 	)
 
 	if err := rootCmd.Execute(); err != nil {
