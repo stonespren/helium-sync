@@ -68,19 +68,25 @@ log_info "All checks passed."
 # -------------------------------------------------------
 log_step "Bumping version to ${VERSION}..."
 
-# cmd/helium-sync/main.go
-MAIN_GO="${PROJECT_DIR}/cmd/helium-sync/main.go"
-CURRENT_VERSION=$(grep -oP '(?<=var version = ")[^"]+' "${MAIN_GO}")
-sed -i "s/var version = \"${CURRENT_VERSION}\"/var version = \"${VERSION}\"/" "${MAIN_GO}"
-log_info "Updated main.go: ${CURRENT_VERSION} -> ${VERSION}"
-
-# packaging/arch/PKGBUILD
+# packaging/arch/PKGBUILD — single source of truth for the version in-tree.
+# main.go uses "dev" as a fallback; the real version is injected via ldflags at build time.
 PKGBUILD="${PROJECT_DIR}/packaging/arch/PKGBUILD"
 CURRENT_PKGVER=$(grep -oP '(?<=pkgver=)[^\s]+' "${PKGBUILD}")
 sed -i "s/pkgver=${CURRENT_PKGVER}/pkgver=${VERSION}/" "${PKGBUILD}"
 # Reset pkgrel to 1 for a new upstream version
 sed -i 's/pkgrel=[0-9]\+/pkgrel=1/' "${PKGBUILD}"
 log_info "Updated PKGBUILD: ${CURRENT_PKGVER} -> ${VERSION}"
+
+# Regenerate .SRCINFO from PKGBUILD (requires makepkg, Arch Linux only)
+SRCINFO="${PROJECT_DIR}/packaging/arch/.SRCINFO"
+if command -v makepkg &>/dev/null; then
+    pushd "${PROJECT_DIR}/packaging/arch" > /dev/null
+    makepkg --printsrcinfo > .SRCINFO
+    popd > /dev/null
+    log_info ".SRCINFO regenerated."
+else
+    log_warn "makepkg not found — .SRCINFO not regenerated. Update it manually on an Arch machine before pushing to AUR."
+fi
 
 # -------------------------------------------------------
 # Verify build
@@ -94,7 +100,7 @@ log_info "Build successful."
 # Commit, tag, push
 # -------------------------------------------------------
 log_step "Committing version bump..."
-git add cmd/helium-sync/main.go packaging/arch/PKGBUILD
+git add packaging/arch/PKGBUILD packaging/arch/.SRCINFO
 git commit -m "chore: release ${TAG}"
 
 log_step "Creating tag ${TAG}..."

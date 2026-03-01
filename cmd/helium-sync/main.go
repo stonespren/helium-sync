@@ -7,7 +7,9 @@ import (
 	"github.com/spf13/cobra"
 )
 
-var version = "0.1.0"
+// version is set at build time via -ldflags "-X main.version=<ver>".
+// Falls back to "dev" for local builds.
+var version = "dev"
 
 func main() {
 	rootCmd := &cobra.Command{
