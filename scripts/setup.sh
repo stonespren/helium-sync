@@ -166,6 +166,30 @@ if [[ "${UNINSTALL}" == "true" ]]; then
 fi
 
 # ============================================================
+# Load config override if provided
+# ============================================================
+if [[ -n "${CONFIG_OVERRIDE}" ]]; then
+    if [[ ! -f "${CONFIG_OVERRIDE}" ]]; then
+        log_error "Config file not found: ${CONFIG_OVERRIDE}"
+        exit 1
+    fi
+    log_info "Loading config from: ${CONFIG_OVERRIDE}"
+    # Read values from JSON config override
+    _cfg_bucket=$(jq -r '.s3_bucket // empty' "${CONFIG_OVERRIDE}" 2>/dev/null || true)
+    _cfg_region=$(jq -r '.s3_region // empty' "${CONFIG_OVERRIDE}" 2>/dev/null || true)
+    _cfg_profile=$(jq -r '.aws_profile // empty' "${CONFIG_OVERRIDE}" 2>/dev/null || true)
+    _cfg_helium=$(jq -r '.helium_dir // empty' "${CONFIG_OVERRIDE}" 2>/dev/null || true)
+    _cfg_interval=$(jq -r '.sync_interval_minutes // empty' "${CONFIG_OVERRIDE}" 2>/dev/null || true)
+    _cfg_sse=$(jq -r '.sse_s3 // empty' "${CONFIG_OVERRIDE}" 2>/dev/null || true)
+    [[ -n "${_cfg_bucket}" ]] && S3_BUCKET="${_cfg_bucket}"
+    [[ -n "${_cfg_region}" ]] && AWS_REGION="${_cfg_region}"
+    [[ -n "${_cfg_profile}" ]] && AWS_PROFILE_NAME="${_cfg_profile}"
+    [[ -n "${_cfg_helium}" ]] && HELIUM_DIR="${_cfg_helium}"
+    [[ -n "${_cfg_interval}" ]] && SYNC_INTERVAL="${_cfg_interval}"
+    [[ -n "${_cfg_sse}" ]] && SSE_ENABLED="${_cfg_sse}"
+fi
+
+# ============================================================
 # Step 1: Check dependencies
 # ============================================================
 log_step "Checking dependencies..."
@@ -211,10 +235,14 @@ log_info "All dependencies satisfied."
 # ============================================================
 log_step "Configuring AWS credentials..."
 
-AWS_PROFILE_NAME=""
-AWS_REGION=""
+# Preserve values loaded from --config override
+_PRELOADED_AWS_PROFILE="${AWS_PROFILE_NAME:-}"
+_PRELOADED_AWS_REGION="${AWS_REGION:-}"
 
-if [[ -f "${HOME}/.aws/credentials" ]]; then
+if [[ -n "${_PRELOADED_AWS_PROFILE}" ]]; then
+    AWS_PROFILE_NAME="${_PRELOADED_AWS_PROFILE}"
+    log_info "Using AWS profile from config: ${AWS_PROFILE_NAME}"
+elif [[ -f "${HOME}/.aws/credentials" ]]; then
     log_info "Found existing AWS credentials."
 
     # List available profiles
@@ -281,8 +309,13 @@ fi
 # ============================================================
 log_step "Configuring AWS region..."
 
-DEFAULT_REGION=$(aws configure get region --profile "${AWS_PROFILE_NAME}" 2>/dev/null || echo "us-east-1")
-prompt AWS_REGION "AWS region" "${DEFAULT_REGION}"
+if [[ -n "${_PRELOADED_AWS_REGION}" ]]; then
+    AWS_REGION="${_PRELOADED_AWS_REGION}"
+    log_info "Using AWS region from config: ${AWS_REGION}"
+else
+    DEFAULT_REGION=$(aws configure get region --profile "${AWS_PROFILE_NAME}" 2>/dev/null || echo "us-east-1")
+    prompt AWS_REGION "AWS region" "${DEFAULT_REGION}"
+fi
 
 export AWS_PROFILE="${AWS_PROFILE_NAME}"
 export AWS_DEFAULT_REGION="${AWS_REGION}"
@@ -292,10 +325,13 @@ export AWS_DEFAULT_REGION="${AWS_REGION}"
 # ============================================================
 log_step "Configuring S3 bucket..."
 
-EXISTING_BUCKETS=$(aws s3 ls --profile "${AWS_PROFILE_NAME}" 2>/dev/null | awk '{print $3}' || true)
-S3_BUCKET=""
+if [[ -n "${S3_BUCKET:-}" ]]; then
+    log_info "Using S3 bucket from config: ${S3_BUCKET}"
+else
+    EXISTING_BUCKETS=$(aws s3 ls --profile "${AWS_PROFILE_NAME}" 2>/dev/null | awk '{print $3}' || true)
+    S3_BUCKET=""
 
-if [[ -n "${EXISTING_BUCKETS}" ]] && [[ "${NON_INTERACTIVE}" == "false" ]]; then
+    if [[ -n "${EXISTING_BUCKETS}" ]] && [[ "${NON_INTERACTIVE}" == "false" ]]; then
     echo "Available S3 buckets:"
     BUCKET_ARRAY=()
     while IFS= read -r line; do
@@ -336,9 +372,8 @@ else
         fi
     fi
 fi
+fi # end S3_BUCKET check
 
-# ============================================================
-# Step 7: Validate S3 access
 # ============================================================
 log_step "Validating S3 access..."
 
@@ -354,7 +389,11 @@ fi
 # ============================================================
 log_step "Configuring Helium browser path..."
 
-prompt HELIUM_DIR "Helium browser config path" "${DEFAULT_HELIUM_DIR}"
+if [[ -n "${HELIUM_DIR:-}" ]]; then
+    log_info "Using Helium dir from config: ${HELIUM_DIR}"
+else
+    prompt HELIUM_DIR "Helium browser config path" "${DEFAULT_HELIUM_DIR}"
+fi
 
 if [[ ! -d "${HELIUM_DIR}" ]]; then
     log_warn "Directory not found: ${HELIUM_DIR}"
@@ -399,7 +438,11 @@ fi
 # ============================================================
 log_step "Configuring sync interval..."
 
-prompt SYNC_INTERVAL "Sync interval in minutes" "${DEFAULT_SYNC_INTERVAL}"
+if [[ -n "${SYNC_INTERVAL:-}" ]]; then
+    log_info "Using sync interval from config: ${SYNC_INTERVAL} minutes"
+else
+    prompt SYNC_INTERVAL "Sync interval in minutes" "${DEFAULT_SYNC_INTERVAL}"
+fi
 
 # Validate numeric
 if ! [[ "${SYNC_INTERVAL}" =~ ^[0-9]+$ ]] || [[ "${SYNC_INTERVAL}" -lt 1 ]]; then
@@ -410,9 +453,13 @@ fi
 # ============================================================
 # SSE-S3 support
 # ============================================================
-SSE_ENABLED=false
-if confirm "Enable server-side encryption (SSE-S3)?" "y"; then
-    SSE_ENABLED=true
+if [[ -n "${SSE_ENABLED:-}" ]]; then
+    log_info "Using SSE setting from config: ${SSE_ENABLED}"
+else
+    SSE_ENABLED=false
+    if confirm "Enable server-side encryption (SSE-S3)?" "y"; then
+        SSE_ENABLED=true
+    fi
 fi
 
 # ============================================================

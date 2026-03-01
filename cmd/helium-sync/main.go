@@ -1,10 +1,10 @@
 package main
 
 import (
-"fmt"
-"os"
+	"fmt"
+	"os"
 
-"github.com/spf13/cobra"
+	"github.com/spf13/cobra"
 )
 
 var version = "0.1.0"
@@ -35,7 +35,7 @@ via systemd timer and manual control via CLI.`,
 	}
 
 	rootCmd.AddCommand(
-newSyncCmd(),
+		newSyncCmd(),
 		newRestoreCmd(),
 		newConfigCmd(),
 		newLogsCmd(),

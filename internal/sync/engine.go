@@ -2,10 +2,13 @@
 package sync
 
 import (
+	"bufio"
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -14,14 +17,21 @@ import (
 	s3client "github.com/helium-sync/helium-sync/internal/s3"
 )
 
-// Delta describes what changed for a file.
+const (
+	// Minimum seconds between sync runs to debounce rapid changes.
+	debounceSeconds = 30
+)
+
+// Delta describes what changed for a file using three-way comparison.
 type Delta struct {
-	RelPath      string
-	LocalOnly    bool
-	RemoteOnly   bool
-	LocalChanged bool
-	RemoteChanged bool
-	BothChanged  bool
+	RelPath       string
+	LocalOnly     bool // exists locally but not in baseline or remote (new local)
+	RemoteOnly    bool // exists in remote but not in baseline or local (new remote)
+	LocalChanged  bool // local differs from baseline, remote matches baseline
+	RemoteChanged bool // remote differs from baseline, local matches baseline
+	BothChanged   bool // both local and remote differ from baseline
+	LocalDeleted  bool // was in baseline, gone locally, still in remote
+	RemoteDeleted bool // was in baseline, gone remotely, still locally
 }
 
 // SyncResult contains the result of a sync operation.
@@ -33,6 +43,14 @@ type SyncResult struct {
 	Skipped     int
 	Errors      []string
 }
+
+// ConflictChoice represents a user's conflict resolution choice.
+type ConflictChoice int
+
+const (
+	ChoiceKeepLocal  ConflictChoice = 1
+	ChoiceKeepRemote ConflictChoice = 2
+)
 
 // Engine performs sync operations.
 type Engine struct {
@@ -54,7 +72,7 @@ func NewEngine(cfg *config.Config) (*Engine, error) {
 	}, nil
 }
 
-// AcquireLock attempts to acquire a file lock.
+// AcquireLock attempts to acquire a file lock for safe concurrent execution.
 func AcquireLock() (*os.File, error) {
 	lockPath := config.LockFilePath()
 	dir := filepath.Dir(lockPath)
@@ -85,10 +103,19 @@ func ReleaseLock(f *os.File) {
 	}
 }
 
-// SyncProfile synchronizes a single profile.
+// SyncProfile synchronizes a single profile using three-way merge.
 func (e *Engine) SyncProfile(ctx context.Context, prof profile.Profile, interactive bool) (*SyncResult, error) {
 	e.logger.Infof("starting sync for profile: %s", prof.Name)
 	result := &SyncResult{ProfileName: prof.Name}
+
+	// Debounce: skip if last sync was too recent
+	if lastSync, err := GetLastSyncTime(prof.Name); err == nil {
+		elapsed := time.Since(lastSync).Seconds()
+		if elapsed < debounceSeconds {
+			e.logger.Infof("debounce: last sync was %.0fs ago, skipping (threshold %ds)", elapsed, debounceSeconds)
+			return result, nil
+		}
+	}
 
 	// Check if Helium holds the profile lock
 	if profile.IsLocked(prof.Path) {
@@ -122,83 +149,181 @@ func (e *Engine) SyncProfile(ctx context.Context, prof profile.Profile, interact
 		return nil, fmt.Errorf("getting remote manifest: %w", err)
 	}
 
-	// No remote manifest - initial upload
+	// No remote manifest — first upload
 	if remoteManifest == nil {
 		e.logger.Info("no remote manifest found, performing initial upload")
-		return e.initialUpload(ctx, prof, localFiles, localChecksums, deviceID)
+		res, err := e.initialUpload(ctx, prof, localFiles, localChecksums, deviceID)
+		if err != nil {
+			return nil, err
+		}
+		e.saveLocalManifest(prof.Name, localChecksums)
+		return res, nil
 	}
 
-	// Step 4: Compute delta
-	e.logger.Debug("computing delta")
-	deltas := computeDeltas(localChecksums, remoteManifest.FileChecksums)
+	// Load the baseline (local copy of manifest from last successful sync)
+	baseline := e.loadLocalManifest(prof.Name)
 
-	// Check for conflicts
-	hasConflicts := false
+	// Step 4: Compute three-way delta
+	e.logger.Debug("computing three-way delta")
+	deltas := computeThreeWayDeltas(baseline, localChecksums, remoteManifest.FileChecksums)
+
+	if len(deltas) == 0 {
+		e.logger.Info("no changes detected")
+		e.saveLastSyncTime(prof.Name, time.Now().UTC())
+		return result, nil
+	}
+
+	// Check for conflicts (BothChanged)
+	var conflicts []Delta
 	for _, d := range deltas {
 		if d.BothChanged {
-			hasConflicts = true
-			break
+			conflicts = append(conflicts, d)
 		}
 	}
 
-	if hasConflicts && interactive {
-		// In interactive mode, conflicts need to be resolved by the caller
-		e.logger.Warn("conflicts detected during sync")
-		return nil, fmt.Errorf("CONFLICT: both local and remote have changes since last sync")
+	// Resolve conflicts
+	conflictChoice := ChoiceKeepLocal // default: last-writer-wins in background
+	if len(conflicts) > 0 {
+		if interactive {
+			choice, err := promptConflictResolution(conflicts)
+			if err != nil {
+				return nil, fmt.Errorf("conflict resolution: %w", err)
+			}
+			conflictChoice = choice
+		} else {
+			// Background: newer timestamp wins
+			if remoteManifest.LastSyncTimestamp.After(time.Now().UTC().Add(-time.Second)) {
+				conflictChoice = ChoiceKeepRemote
+			} else {
+				conflictChoice = ChoiceKeepLocal
+			}
+			e.logger.Infof("background conflict resolution: keeping %s (last-writer-wins)",
+				map[ConflictChoice]string{ChoiceKeepLocal: "local", ChoiceKeepRemote: "remote"}[conflictChoice])
+		}
 	}
 
-	// Step 5: Upload/download changed files
+	// Step 5: Apply deltas
+	// Build the merged checksum map for the new manifest
+	mergedChecksums := make(map[string]string)
+	// Start with everything that's unchanged
+	for k, v := range localChecksums {
+		mergedChecksums[k] = v
+	}
+
 	for _, d := range deltas {
-		if d.LocalOnly || d.LocalChanged || d.BothChanged {
-			// Upload local file
+		switch {
+		case d.LocalOnly:
+			// New local file — upload
 			entry, ok := localFileMap[d.RelPath]
 			if !ok {
 				continue
 			}
-			e.logger.Debugf("uploading: %s", d.RelPath)
+			e.logger.Debugf("uploading (new local): %s", d.RelPath)
 			if err := e.s3.UploadFile(ctx, prof.Name, d.RelPath, entry.FullPath); err != nil {
 				result.Errors = append(result.Errors, fmt.Sprintf("upload %s: %v", d.RelPath, err))
 				continue
 			}
 			result.Uploaded++
-		} else if d.RemoteOnly || d.RemoteChanged {
-			// Download from remote
+			mergedChecksums[d.RelPath] = localChecksums[d.RelPath]
+
+		case d.RemoteOnly:
+			// New remote file — download
 			localPath := filepath.Join(prof.Path, d.RelPath)
-			e.logger.Debugf("downloading: %s", d.RelPath)
+			e.logger.Debugf("downloading (new remote): %s", d.RelPath)
 			if err := e.s3.DownloadFile(ctx, prof.Name, d.RelPath, localPath); err != nil {
 				result.Errors = append(result.Errors, fmt.Sprintf("download %s: %v", d.RelPath, err))
 				continue
 			}
 			result.Downloaded++
-		}
-	}
+			mergedChecksums[d.RelPath] = remoteManifest.FileChecksums[d.RelPath]
 
-	// Handle files deleted locally (present in remote but not locally)
-	for relPath := range remoteManifest.FileChecksums {
-		if _, exists := localChecksums[relPath]; !exists {
-			// File was deleted locally - also remove from remote
-			e.logger.Debugf("removing from remote (deleted locally): %s", relPath)
-			if err := e.s3.DeleteFile(ctx, prof.Name, relPath); err != nil {
-				result.Errors = append(result.Errors, fmt.Sprintf("delete %s: %v", relPath, err))
+		case d.LocalChanged:
+			// Local changed, remote same as baseline — upload
+			entry, ok := localFileMap[d.RelPath]
+			if !ok {
+				continue
+			}
+			e.logger.Debugf("uploading (local changed): %s", d.RelPath)
+			if err := e.s3.UploadFile(ctx, prof.Name, d.RelPath, entry.FullPath); err != nil {
+				result.Errors = append(result.Errors, fmt.Sprintf("upload %s: %v", d.RelPath, err))
+				continue
+			}
+			result.Uploaded++
+			mergedChecksums[d.RelPath] = localChecksums[d.RelPath]
+
+		case d.RemoteChanged:
+			// Remote changed, local same as baseline — download
+			localPath := filepath.Join(prof.Path, d.RelPath)
+			e.logger.Debugf("downloading (remote changed): %s", d.RelPath)
+			if err := e.s3.DownloadFile(ctx, prof.Name, d.RelPath, localPath); err != nil {
+				result.Errors = append(result.Errors, fmt.Sprintf("download %s: %v", d.RelPath, err))
+				continue
+			}
+			result.Downloaded++
+			mergedChecksums[d.RelPath] = remoteManifest.FileChecksums[d.RelPath]
+
+		case d.BothChanged:
+			// Conflict — use resolution choice
+			if conflictChoice == ChoiceKeepLocal {
+				entry, ok := localFileMap[d.RelPath]
+				if !ok {
+					continue
+				}
+				e.logger.Debugf("uploading (conflict, keep local): %s", d.RelPath)
+				if err := e.s3.UploadFile(ctx, prof.Name, d.RelPath, entry.FullPath); err != nil {
+					result.Errors = append(result.Errors, fmt.Sprintf("upload %s: %v", d.RelPath, err))
+					continue
+				}
+				result.Uploaded++
+				mergedChecksums[d.RelPath] = localChecksums[d.RelPath]
+			} else {
+				localPath := filepath.Join(prof.Path, d.RelPath)
+				e.logger.Debugf("downloading (conflict, keep remote): %s", d.RelPath)
+				if err := e.s3.DownloadFile(ctx, prof.Name, d.RelPath, localPath); err != nil {
+					result.Errors = append(result.Errors, fmt.Sprintf("download %s: %v", d.RelPath, err))
+					continue
+				}
+				result.Downloaded++
+				mergedChecksums[d.RelPath] = remoteManifest.FileChecksums[d.RelPath]
+			}
+
+		case d.LocalDeleted:
+			// File deleted locally, still in remote — remove from remote
+			e.logger.Debugf("deleting from remote (deleted locally): %s", d.RelPath)
+			if err := e.s3.DeleteFile(ctx, prof.Name, d.RelPath); err != nil {
+				result.Errors = append(result.Errors, fmt.Sprintf("delete %s: %v", d.RelPath, err))
 				continue
 			}
 			result.Deleted++
+			delete(mergedChecksums, d.RelPath)
+
+		case d.RemoteDeleted:
+			// File deleted remotely, still locally — remove local
+			localPath := filepath.Join(prof.Path, d.RelPath)
+			e.logger.Debugf("deleting local (deleted remotely): %s", d.RelPath)
+			if err := os.Remove(localPath); err != nil && !os.IsNotExist(err) {
+				result.Errors = append(result.Errors, fmt.Sprintf("local delete %s: %v", d.RelPath, err))
+				continue
+			}
+			result.Deleted++
+			delete(mergedChecksums, d.RelPath)
 		}
 	}
 
 	// Step 6: Update remote manifest
 	now := time.Now().UTC()
 	newManifest := &s3client.Manifest{
-		DeviceID:          deviceID,
-		LastSyncTimestamp:  now,
-		FileChecksums:     localChecksums,
+		DeviceID:         deviceID,
+		LastSyncTimestamp: now,
+		FileChecksums:    mergedChecksums,
 	}
 	if err := e.s3.PutManifest(ctx, prof.Name, newManifest); err != nil {
 		return nil, fmt.Errorf("updating manifest: %w", err)
 	}
 
-	// Step 7: Update local last sync time
+	// Step 7: Update local state
 	e.saveLastSyncTime(prof.Name, now)
+	e.saveLocalManifest(prof.Name, mergedChecksums)
 
 	e.logger.Infof("sync complete for %s: uploaded=%d downloaded=%d deleted=%d errors=%d",
 		prof.Name, result.Uploaded, result.Downloaded, result.Deleted, len(result.Errors))
@@ -263,12 +388,15 @@ func (e *Engine) RestoreProfile(ctx context.Context, prof profile.Profile) (*Syn
 	deviceID, _ := config.GetDeviceID()
 	now := time.Now().UTC()
 	newManifest := &s3client.Manifest{
-		DeviceID:          deviceID,
-		LastSyncTimestamp:  now,
-		FileChecksums:     manifest.FileChecksums,
+		DeviceID:         deviceID,
+		LastSyncTimestamp: now,
+		FileChecksums:    manifest.FileChecksums,
 	}
-	e.s3.PutManifest(ctx, prof.Name, newManifest)
+	if err := e.s3.PutManifest(ctx, prof.Name, newManifest); err != nil {
+		e.logger.Error("failed to update manifest after restore", err)
+	}
 	e.saveLastSyncTime(prof.Name, now)
+	e.saveLocalManifest(prof.Name, manifest.FileChecksums)
 
 	e.logger.Infof("restore complete for %s: downloaded=%d errors=%d",
 		prof.Name, result.Downloaded, len(result.Errors))
@@ -280,6 +408,7 @@ func (e *Engine) GetRemoteProfiles(ctx context.Context) ([]string, error) {
 	return e.s3.ListRemoteProfiles(ctx)
 }
 
+// initialUpload uploads all allowed files for the first time.
 func (e *Engine) initialUpload(ctx context.Context, prof profile.Profile, files []profile.FileEntry, checksums map[string]string, deviceID string) (*SyncResult, error) {
 	result := &SyncResult{ProfileName: prof.Name}
 
@@ -294,9 +423,9 @@ func (e *Engine) initialUpload(ctx context.Context, prof profile.Profile, files 
 
 	now := time.Now().UTC()
 	manifest := &s3client.Manifest{
-		DeviceID:          deviceID,
-		LastSyncTimestamp:  now,
-		FileChecksums:     checksums,
+		DeviceID:         deviceID,
+		LastSyncTimestamp: now,
+		FileChecksums:    checksums,
 	}
 	if err := e.s3.PutManifest(ctx, prof.Name, manifest); err != nil {
 		return nil, fmt.Errorf("initial manifest upload: %w", err)
@@ -306,34 +435,160 @@ func (e *Engine) initialUpload(ctx context.Context, prof profile.Profile, files 
 	return result, nil
 }
 
-func computeDeltas(localChecksums, remoteChecksums map[string]string) []Delta {
+// computeThreeWayDeltas computes deltas using baseline, local, and remote checksums.
+// baseline is the state at last successful sync (nil map for first sync on this device).
+// This enables correct bidirectional sync: we can tell whether a difference is
+// a local change, a remote change, or a conflict.
+func computeThreeWayDeltas(baseline, local, remote map[string]string) []Delta {
 	var deltas []Delta
 
 	allPaths := make(map[string]bool)
-	for p := range localChecksums {
+	for p := range baseline {
 		allPaths[p] = true
 	}
-	for p := range remoteChecksums {
+	for p := range local {
+		allPaths[p] = true
+	}
+	for p := range remote {
 		allPaths[p] = true
 	}
 
 	for path := range allPaths {
-		localSum, hasLocal := localChecksums[path]
-		remoteSum, hasRemote := remoteChecksums[path]
+		baseSum, inBase := baseline[path]
+		localSum, inLocal := local[path]
+		remoteSum, inRemote := remote[path]
 
-		if hasLocal && !hasRemote {
+		localSame := inLocal && inBase && localSum == baseSum
+		remoteSame := inRemote && inBase && remoteSum == baseSum
+		localNew := inLocal && !inBase
+		remoteNew := inRemote && !inBase
+		localGone := !inLocal && inBase
+		remoteGone := !inRemote && inBase
+
+		switch {
+		// Both match baseline or each other — no change
+		case inLocal && inRemote && localSum == remoteSum:
+			continue
+
+		// New file only on local side (not in baseline, not in remote)
+		case localNew && !inRemote:
 			deltas = append(deltas, Delta{RelPath: path, LocalOnly: true})
-		} else if !hasLocal && hasRemote {
+
+		// New file only on remote side (not in baseline, not in local)
+		case remoteNew && !inLocal:
 			deltas = append(deltas, Delta{RelPath: path, RemoteOnly: true})
-		} else if localSum != remoteSum {
-			// Both exist but different - last writer wins in background
+
+		// Local changed from baseline, remote unchanged
+		case inLocal && inRemote && !localSame && remoteSame:
 			deltas = append(deltas, Delta{RelPath: path, LocalChanged: true})
+
+		// Remote changed from baseline, local unchanged
+		case inLocal && inRemote && localSame && !remoteSame:
+			deltas = append(deltas, Delta{RelPath: path, RemoteChanged: true})
+
+		// Both changed from baseline differently
+		case inLocal && inRemote && !localSame && !remoteSame && localSum != remoteSum:
+			deltas = append(deltas, Delta{RelPath: path, BothChanged: true})
+
+		// File deleted locally (was in baseline, still in remote, gone locally)
+		case localGone && inRemote && remoteSame:
+			deltas = append(deltas, Delta{RelPath: path, LocalDeleted: true})
+
+		// File deleted remotely (was in baseline, still locally, gone in remote)
+		case remoteGone && inLocal && localSame:
+			deltas = append(deltas, Delta{RelPath: path, RemoteDeleted: true})
+
+		// File deleted locally but remote also changed — conflict, treat as BothChanged
+		case localGone && inRemote && !remoteSame:
+			deltas = append(deltas, Delta{RelPath: path, BothChanged: true})
+
+		// File deleted remotely but local also changed — conflict, treat as BothChanged
+		case remoteGone && inLocal && !localSame:
+			deltas = append(deltas, Delta{RelPath: path, BothChanged: true})
+
+		// Both new but different content
+		case localNew && remoteNew && localSum != remoteSum:
+			deltas = append(deltas, Delta{RelPath: path, BothChanged: true})
+
+		// Both deleted — nothing to do
+		case localGone && remoteGone:
+			continue
+
+		// Fallback: if local and remote differ, treat as local changed (last-writer-wins)
+		default:
+			if inLocal && (!inRemote || localSum != remoteSum) {
+				deltas = append(deltas, Delta{RelPath: path, LocalChanged: true})
+			} else if inRemote && !inLocal {
+				deltas = append(deltas, Delta{RelPath: path, RemoteOnly: true})
+			}
 		}
-		// If checksums match, no delta
 	}
 
 	return deltas
 }
+
+// promptConflictResolution shows conflicting files and asks the user to choose.
+func promptConflictResolution(conflicts []Delta) (ConflictChoice, error) {
+	fmt.Println("\nConflict detected: both local and remote have changed since last sync.")
+	fmt.Println("The following files are in conflict:")
+	for _, c := range conflicts {
+		fmt.Printf("  - %s\n", c.RelPath)
+	}
+	fmt.Println("\nChoose resolution:")
+	fmt.Println("  1) Keep local (upload local versions)")
+	fmt.Println("  2) Keep remote (download remote versions)")
+	fmt.Print("Choice [1/2]: ")
+
+	reader := bufio.NewReader(os.Stdin)
+	input, _ := reader.ReadString('\n')
+	input = strings.TrimSpace(input)
+
+	switch input {
+	case "1":
+		return ChoiceKeepLocal, nil
+	case "2":
+		return ChoiceKeepRemote, nil
+	default:
+		return ChoiceKeepLocal, fmt.Errorf("invalid choice: %q, aborting", input)
+	}
+}
+
+// --- Local manifest persistence ---
+
+// localManifestPath returns the path where we store the baseline checksums.
+func localManifestPath(profileName string) string {
+	return filepath.Join(config.StateDir(), fmt.Sprintf("manifest_%s.json", profileName))
+}
+
+// saveLocalManifest persists the merged checksum state after a successful sync.
+func (e *Engine) saveLocalManifest(profileName string, checksums map[string]string) {
+	stateDir := config.StateDir()
+	os.MkdirAll(stateDir, 0700)
+	data, err := json.Marshal(checksums)
+	if err != nil {
+		e.logger.Error("failed to marshal local manifest", err)
+		return
+	}
+	if err := os.WriteFile(localManifestPath(profileName), data, 0600); err != nil {
+		e.logger.Error("failed to save local manifest", err)
+	}
+}
+
+// loadLocalManifest reads the baseline checksum state from last successful sync.
+func (e *Engine) loadLocalManifest(profileName string) map[string]string {
+	data, err := os.ReadFile(localManifestPath(profileName))
+	if err != nil {
+		return make(map[string]string) // empty baseline = first sync on this device
+	}
+	var checksums map[string]string
+	if err := json.Unmarshal(data, &checksums); err != nil {
+		e.logger.Warn("corrupt local manifest, treating as first sync")
+		return make(map[string]string)
+	}
+	return checksums
+}
+
+// --- Time persistence ---
 
 func (e *Engine) saveLastSyncTime(profileName string, t time.Time) {
 	stateDir := config.StateDir()
