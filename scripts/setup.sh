@@ -180,6 +180,108 @@ interactive_select() {
     eval "${_result_var}=${_selected}"
 }
 
+# Interactive multi-select with arrow keys, j/k navigation, and space/tab to toggle
+# Usage: interactive_multi_select RESULT_VAR "prompt" option1 option2 ...
+# Sets RESULT_VAR to a space-separated list of selected indices (0-based)
+interactive_multi_select() {
+    local _result_var="$1"
+    local _prompt="$2"
+    shift 2
+    local -a _options=("$@")
+    local _count=${#_options[@]}
+    local _cursor=0
+
+    if [[ ${_count} -eq 0 ]]; then
+        log_error "No options provided to multi-selector."
+        return 1
+    fi
+
+    # Track selected state for each option (0=unselected, 1=selected)
+    local -a _selected
+    for (( i=0; i<_count; i++ )); do
+        _selected[${i}]=1  # all selected by default
+    done
+
+    echo -e "${BLUE}?${NC} ${_prompt}"
+    echo -e "  ${YELLOW}Use ↑/↓ or k/j to move, Space/Tab to toggle, Enter to confirm${NC}"
+    echo
+
+    # Hide cursor
+    tput civis 2>/dev/null || true
+
+    # Render function
+    _render_multi_options() {
+        # Move up to overwrite previous render (skip on first render)
+        if [[ ${1:-0} -eq 1 ]]; then
+            for (( i=0; i<_count; i++ )); do
+                tput cuu1 2>/dev/null
+                tput el 2>/dev/null
+            done
+        fi
+        for (( i=0; i<_count; i++ )); do
+            local marker="  "
+            if [[ ${_selected[${i}]} -eq 1 ]]; then
+                marker="✔ "
+            fi
+            if [[ ${i} -eq ${_cursor} ]]; then
+                echo -e "  ${GREEN}❯ ${marker}${_options[${i}]}${NC}"
+            else
+                echo -e "    ${marker}${_options[${i}]}"
+            fi
+        done
+    }
+
+    _render_multi_options 0
+
+    while true; do
+        # Read a single character (raw mode)
+        IFS= read -rsn1 key
+        case "${key}" in
+            $'\x1b')  # Escape sequence (arrow keys)
+                read -rsn2 -t 0.1 seq || true
+                case "${seq}" in
+                    '[A') # Up arrow
+                        if (( _cursor > 0 )); then _cursor=$((_cursor - 1)); fi
+                        ;;
+                    '[B') # Down arrow
+                        if (( _cursor < _count - 1 )); then _cursor=$((_cursor + 1)); fi
+                        ;;
+                esac
+                ;;
+            'k'|'K')  # Vim up
+                if (( _cursor > 0 )); then _cursor=$((_cursor - 1)); fi
+                ;;
+            'j'|'J')  # Vim down
+                if (( _cursor < _count - 1 )); then _cursor=$((_cursor + 1)); fi
+                ;;
+            ' '|$'\t')  # Space or Tab to toggle
+                if [[ ${_selected[${_cursor}]} -eq 1 ]]; then
+                    _selected[${_cursor}]=0
+                else
+                    _selected[${_cursor}]=1
+                fi
+                ;;
+            '')  # Enter to confirm
+                break
+                ;;
+        esac
+        _render_multi_options 1
+    done
+
+    # Show cursor
+    tput cnorm 2>/dev/null || true
+    echo
+
+    # Build result: space-separated indices of selected items
+    local _result=""
+    for (( i=0; i<_count; i++ )); do
+        if [[ ${_selected[${i}]} -eq 1 ]]; then
+            _result="${_result} ${i}"
+        fi
+    done
+    eval "${_result_var}='${_result# }'"
+}
+
 confirm() {
     local prompt_text="$1"
     local default="${2:-n}"
@@ -406,6 +508,19 @@ export AWS_PROFILE="${AWS_PROFILE_NAME}"
 export AWS_DEFAULT_REGION="${AWS_REGION}"
 
 # ============================================================
+# Validate AWS credentials
+# ============================================================
+log_step "Validating AWS credentials..."
+
+if aws s3 ls --profile "${AWS_PROFILE_NAME}" --region "${AWS_REGION}" &>/dev/null; then
+    log_info "AWS credentials are valid."
+else
+    log_error "AWS credentials check failed. Unable to reach S3 with profile '${AWS_PROFILE_NAME}' in region '${AWS_REGION}'."
+    log_error "Please verify your credentials and try again."
+    exit 1
+fi
+
+# ============================================================
 # Step 5-6: S3 bucket
 # ============================================================
 log_step "Configuring S3 bucket..."
@@ -413,50 +528,56 @@ log_step "Configuring S3 bucket..."
 if [[ -n "${S3_BUCKET:-}" ]]; then
     log_info "Using S3 bucket from config: ${S3_BUCKET}"
 else
-    EXISTING_BUCKETS=$(aws s3 ls --profile "${AWS_PROFILE_NAME}" 2>/dev/null | awk '{print $3}' || true)
-    S3_BUCKET=""
+    log_info "Fetching available S3 buckets..."
+    EXISTING_BUCKETS=$(aws s3api list-buckets --profile "${AWS_PROFILE_NAME}" --region "${AWS_REGION}" \
+        --query 'Buckets[].Name' --output text 2>/dev/null || true)
 
-    if [[ -n "${EXISTING_BUCKETS}" ]] && [[ "${NON_INTERACTIVE}" == "false" ]]; then
-    echo "Available S3 buckets:"
     BUCKET_ARRAY=()
-    while IFS= read -r line; do
-        [[ -n "${line}" ]] && BUCKET_ARRAY+=("${line}")
-    done <<< "${EXISTING_BUCKETS}"
-
-    for i in "${!BUCKET_ARRAY[@]}"; do
-        echo "  $((i + 1))) ${BUCKET_ARRAY[${i}]}"
-    done
-    echo "  $((${#BUCKET_ARRAY[@]} + 1))) Create new bucket"
-
-    prompt BUCKET_IDX "Select bucket number"
-    IDX=$((BUCKET_IDX - 1))
-
-    if [[ ${IDX} -ge 0 && ${IDX} -lt ${#BUCKET_ARRAY[@]} ]]; then
-        S3_BUCKET="${BUCKET_ARRAY[${IDX}]}"
-    else
-        prompt S3_BUCKET "New bucket name"
-        log_info "Creating bucket: ${S3_BUCKET}..."
-        if [[ "${AWS_REGION}" == "us-east-1" ]]; then
-            aws s3 mb "s3://${S3_BUCKET}" --profile "${AWS_PROFILE_NAME}" --region "${AWS_REGION}"
-        else
-            aws s3 mb "s3://${S3_BUCKET}" --profile "${AWS_PROFILE_NAME}" --region "${AWS_REGION}" \
-                --create-bucket-configuration LocationConstraint="${AWS_REGION}"
-        fi
+    if [[ -n "${EXISTING_BUCKETS}" ]]; then
+        for b in ${EXISTING_BUCKETS}; do
+            # Filter to buckets in the selected region
+            BLOC=$(aws s3api get-bucket-location --bucket "${b}" --profile "${AWS_PROFILE_NAME}" \
+                --query 'LocationConstraint' --output text 2>/dev/null || true)
+            # AWS returns "None" for us-east-1
+            [[ "${BLOC}" == "None" || "${BLOC}" == "null" ]] && BLOC="us-east-1"
+            if [[ "${BLOC}" == "${AWS_REGION}" ]]; then
+                BUCKET_ARRAY+=("${b}")
+            fi
+        done
     fi
-else
-    prompt S3_BUCKET "S3 bucket name"
-    # Try to create if it doesn't exist
-    if ! aws s3 ls "s3://${S3_BUCKET}" --profile "${AWS_PROFILE_NAME}" --region "${AWS_REGION}" &>/dev/null; then
-        if confirm "Bucket '${S3_BUCKET}' doesn't exist. Create it?" "y"; then
+
+    if [[ "${NON_INTERACTIVE}" == "true" ]]; then
+        if [[ ${#BUCKET_ARRAY[@]} -gt 0 ]]; then
+            S3_BUCKET="${BUCKET_ARRAY[0]}"
+        else
+            prompt S3_BUCKET "S3 bucket name"
+        fi
+    else
+        # Build menu: existing region-matched buckets + create new
+        BUCKET_MENU=()
+        for b in "${BUCKET_ARRAY[@]}"; do
+            BUCKET_MENU+=("${b}")
+        done
+        BUCKET_MENU+=("Create new bucket")
+
+        interactive_select BUCKET_IDX "Select S3 bucket (${AWS_REGION})" "${BUCKET_MENU[@]}"
+
+        if [[ ${BUCKET_IDX} -eq $((${#BUCKET_MENU[@]} - 1)) ]]; then
+            # User chose "Create new bucket"
+            prompt S3_BUCKET "New bucket name"
+            log_info "Creating bucket: ${S3_BUCKET}..."
             if [[ "${AWS_REGION}" == "us-east-1" ]]; then
-                aws s3 mb "s3://${S3_BUCKET}" --profile "${AWS_PROFILE_NAME}" --region "${AWS_REGION}"
+                aws s3api create-bucket --bucket "${S3_BUCKET}" \
+                    --profile "${AWS_PROFILE_NAME}" --region "${AWS_REGION}"
             else
-                aws s3 mb "s3://${S3_BUCKET}" --profile "${AWS_PROFILE_NAME}" --region "${AWS_REGION}" \
+                aws s3api create-bucket --bucket "${S3_BUCKET}" \
+                    --profile "${AWS_PROFILE_NAME}" --region "${AWS_REGION}" \
                     --create-bucket-configuration LocationConstraint="${AWS_REGION}"
             fi
+        else
+            S3_BUCKET="${BUCKET_ARRAY[${BUCKET_IDX}]}"
         fi
     fi
-fi
 fi # end S3_BUCKET check
 
 # ============================================================
@@ -512,8 +633,25 @@ if [[ ${#DETECTED_PROFILES[@]} -eq 0 ]]; then
     done
 fi
 
+SELECTED_PROFILES=()
 if [[ ${#DETECTED_PROFILES[@]} -gt 0 ]]; then
     log_info "Found profiles: ${DETECTED_PROFILES[*]}"
+
+    if [[ "${NON_INTERACTIVE}" == "true" ]]; then
+        # Non-interactive: select all detected profiles
+        SELECTED_PROFILES=("${DETECTED_PROFILES[@]}")
+    else
+        interactive_multi_select PROFILE_SELECTED_INDICES "Select profiles to sync" "${DETECTED_PROFILES[@]}"
+        for idx in ${PROFILE_SELECTED_INDICES}; do
+            SELECTED_PROFILES+=("${DETECTED_PROFILES[${idx}]}")
+        done
+        if [[ ${#SELECTED_PROFILES[@]} -eq 0 ]]; then
+            log_warn "No profiles selected. All detected profiles will be synced."
+            SELECTED_PROFILES=("${DETECTED_PROFILES[@]}")
+        else
+            log_info "Selected profiles: ${SELECTED_PROFILES[*]}"
+        fi
+    fi
 else
     log_warn "No profiles detected. They will be synced when created."
 fi
@@ -555,6 +693,12 @@ log_step "Writing configuration..."
 mkdir -p "${CONFIG_DIR}" "${STATE_DIR}"
 chmod 700 "${CONFIG_DIR}" "${STATE_DIR}"
 
+# Build sync_profiles JSON array
+SYNC_PROFILES_JSON="[]"
+if [[ ${#SELECTED_PROFILES[@]} -gt 0 ]]; then
+    SYNC_PROFILES_JSON=$(printf '%s\n' "${SELECTED_PROFILES[@]}" | jq -R . | jq -s .)
+fi
+
 cat > "${CONFIG_FILE}" <<EOF
 {
   "helium_dir": "${HELIUM_DIR}",
@@ -562,6 +706,7 @@ cat > "${CONFIG_FILE}" <<EOF
   "s3_region": "${AWS_REGION}",
   "aws_profile": "${AWS_PROFILE_NAME}",
   "sync_interval_minutes": ${SYNC_INTERVAL},
+  "sync_profiles": ${SYNC_PROFILES_JSON},
   "log_level": "info",
   "sse_s3": ${SSE_ENABLED}
 }

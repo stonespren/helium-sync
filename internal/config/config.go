@@ -23,13 +23,14 @@ const (
 
 // Config represents the application configuration.
 type Config struct {
-	HeliumDir    string `json:"helium_dir"`
-	S3Bucket     string `json:"s3_bucket"`
-	S3Region     string `json:"s3_region"`
-	AWSProfile   string `json:"aws_profile,omitempty"`
-	SyncInterval int    `json:"sync_interval_minutes"`
-	LogLevel     string `json:"log_level"`
-	SSE          bool   `json:"sse_s3"`
+	HeliumDir    string   `json:"helium_dir"`
+	S3Bucket     string   `json:"s3_bucket"`
+	S3Region     string   `json:"s3_region"`
+	AWSProfile   string   `json:"aws_profile,omitempty"`
+	SyncInterval int      `json:"sync_interval_minutes"`
+	SyncProfiles []string `json:"sync_profiles,omitempty"`
+	LogLevel     string   `json:"log_level"`
+	SSE          bool     `json:"sse_s3"`
 }
 
 var (

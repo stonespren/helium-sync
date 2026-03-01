@@ -332,7 +332,7 @@ func (e *Engine) SyncProfile(ctx context.Context, prof profile.Profile, interact
 	return result, nil
 }
 
-// SyncAllProfiles syncs all discovered profiles.
+// SyncAllProfiles syncs all discovered profiles, filtered by config if set.
 func (e *Engine) SyncAllProfiles(ctx context.Context, interactive bool) ([]*SyncResult, error) {
 	profiles, err := profile.Discover(e.cfg.HeliumDir)
 	if err != nil {
@@ -341,6 +341,26 @@ func (e *Engine) SyncAllProfiles(ctx context.Context, interactive bool) ([]*Sync
 
 	if len(profiles) == 0 {
 		return nil, fmt.Errorf("no profiles found in %s", e.cfg.HeliumDir)
+	}
+
+	// Filter to configured profiles if sync_profiles is set
+	if len(e.cfg.SyncProfiles) > 0 {
+		allowed := make(map[string]bool, len(e.cfg.SyncProfiles))
+		for _, name := range e.cfg.SyncProfiles {
+			allowed[name] = true
+		}
+		var filtered []profile.Profile
+		for _, prof := range profiles {
+			if allowed[prof.Name] {
+				filtered = append(filtered, prof)
+			} else {
+				e.logger.Debugf("skipping profile %s (not in sync_profiles)", prof.Name)
+			}
+		}
+		profiles = filtered
+		if len(profiles) == 0 {
+			return nil, fmt.Errorf("no matching profiles found for sync_profiles config")
+		}
 	}
 
 	var results []*SyncResult
