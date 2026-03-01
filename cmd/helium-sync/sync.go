@@ -53,6 +53,10 @@ func runSync(profileName string, background bool) error {
 		return err
 	}
 
+	if !background {
+		engine.SetProgress(hsync.NewProgressBar())
+	}
+
 	ctx := context.Background()
 
 	if profileName != "" {
@@ -65,6 +69,7 @@ func runSync(profileName string, background bool) error {
 		if err != nil {
 			return err
 		}
+		fmt.Println()
 		printSyncResult(result)
 		return nil
 	}
@@ -75,6 +80,7 @@ func runSync(profileName string, background bool) error {
 		return err
 	}
 
+	fmt.Println()
 	for _, result := range results {
 		printSyncResult(result)
 	}

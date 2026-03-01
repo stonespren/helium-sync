@@ -47,6 +47,8 @@ func runRestore(all bool) error {
 		return err
 	}
 
+	engine.SetProgress(hsync.NewProgressBar())
+
 	ctx := context.Background()
 
 	// Get remote profiles

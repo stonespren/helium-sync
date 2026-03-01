@@ -35,6 +35,22 @@ var levelFromString = map[string]Level{
 	"error": LevelError,
 }
 
+// ANSI color codes for pretty console output.
+const (
+	colorReset  = "\033[0m"
+	colorDim    = "\033[2m"
+	colorYellow = "\033[33m"
+	colorRed    = "\033[31m"
+	colorCyan   = "\033[36m"
+)
+
+var levelPrefixes = map[Level]string{
+	LevelDebug: colorDim + "  " + colorReset,
+	LevelInfo:  colorCyan + "→" + colorReset + " ",
+	LevelWarn:  colorYellow + "⚠" + colorReset + " ",
+	LevelError: colorRed + "✗" + colorReset + " ",
+}
+
 type LogEntry struct {
 	Timestamp string `json:"timestamp"`
 	Level     string `json:"level"`
@@ -44,11 +60,12 @@ type LogEntry struct {
 }
 
 type Logger struct {
-	mu        sync.Mutex
-	writer    io.Writer
-	level     Level
-	component string
-	logFile   *os.File
+	mu            sync.Mutex
+	fileWriter    io.Writer
+	consoleWriter io.Writer
+	level         Level
+	component     string
+	logFile       *os.File
 }
 
 const (
@@ -85,17 +102,16 @@ func Init(background bool) error {
 		}
 	}
 
-	var writer io.Writer
-	if background {
-		writer = f
-	} else {
-		writer = io.MultiWriter(f, os.Stderr)
+	var consoleWriter io.Writer
+	if !background {
+		consoleWriter = os.Stderr
 	}
 
 	defaultLogger = &Logger{
-		writer:  writer,
-		level:   level,
-		logFile: f,
+		fileWriter:    f,
+		consoleWriter: consoleWriter,
+		level:         level,
+		logFile:       f,
 	}
 	return nil
 }
@@ -109,16 +125,17 @@ func Close() {
 func WithComponent(component string) *Logger {
 	if defaultLogger == nil {
 		return &Logger{
-			writer:    os.Stderr,
-			level:     LevelInfo,
-			component: component,
+			consoleWriter: os.Stderr,
+			level:         LevelInfo,
+			component:     component,
 		}
 	}
 	return &Logger{
-		writer:    defaultLogger.writer,
-		level:     defaultLogger.level,
-		component: component,
-		logFile:   defaultLogger.logFile,
+		fileWriter:    defaultLogger.fileWriter,
+		consoleWriter: defaultLogger.consoleWriter,
+		level:         defaultLogger.level,
+		component:     component,
+		logFile:       defaultLogger.logFile,
 	}
 }
 
@@ -136,7 +153,27 @@ func (l *Logger) log(level Level, msg string, errStr string) {
 	data, _ := json.Marshal(entry)
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	fmt.Fprintln(l.writer, string(data))
+
+	// Always write JSON to the log file
+	if l.fileWriter != nil {
+		fmt.Fprintln(l.fileWriter, string(data))
+	}
+
+	// Write pretty-formatted output to the console
+	if l.consoleWriter != nil {
+		if activeProgress != nil {
+			activeProgress.Clear()
+		}
+		prefix := levelPrefixes[level]
+		if errStr != "" {
+			fmt.Fprintf(l.consoleWriter, "%s%s: %s\n", prefix, msg, errStr)
+		} else {
+			fmt.Fprintf(l.consoleWriter, "%s%s\n", prefix, msg)
+		}
+		if activeProgress != nil {
+			activeProgress.Redraw()
+		}
+	}
 }
 
 func (l *Logger) Debug(msg string) { l.log(LevelDebug, msg, "") }

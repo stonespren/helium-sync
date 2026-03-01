@@ -54,9 +54,10 @@ const (
 
 // Engine performs sync operations.
 type Engine struct {
-	cfg    *config.Config
-	s3     *s3client.Client
-	logger *Logger
+	cfg      *config.Config
+	s3       *s3client.Client
+	logger   *Logger
+	progress *ProgressBar
 }
 
 // NewEngine creates a new sync engine.
@@ -70,6 +71,30 @@ func NewEngine(cfg *config.Config) (*Engine, error) {
 		s3:     client,
 		logger: WithComponent("sync"),
 	}, nil
+}
+
+// SetProgress attaches a progress bar to the engine for interactive display.
+func (e *Engine) SetProgress(p *ProgressBar) {
+	e.progress = p
+	SetActiveProgress(p)
+}
+
+func (e *Engine) startProgress(label string, total int) {
+	if e.progress != nil {
+		e.progress.Start(label, total)
+	}
+}
+
+func (e *Engine) incrementProgress() {
+	if e.progress != nil {
+		e.progress.Increment()
+	}
+}
+
+func (e *Engine) finishProgress() {
+	if e.progress != nil {
+		e.progress.Finish()
+	}
 }
 
 // AcquireLock attempts to acquire a file lock for safe concurrent execution.
@@ -211,105 +236,110 @@ func (e *Engine) SyncProfile(ctx context.Context, prof profile.Profile, interact
 		mergedChecksums[k] = v
 	}
 
+	e.startProgress("Syncing", len(deltas))
 	for _, d := range deltas {
-		switch {
-		case d.LocalOnly:
-			// New local file — upload
-			entry, ok := localFileMap[d.RelPath]
-			if !ok {
-				continue
-			}
-			e.logger.Debugf("uploading (new local): %s", d.RelPath)
-			if err := e.s3.UploadFile(ctx, prof.Name, d.RelPath, entry.FullPath); err != nil {
-				result.Errors = append(result.Errors, fmt.Sprintf("upload %s: %v", d.RelPath, err))
-				continue
-			}
-			result.Uploaded++
-			mergedChecksums[d.RelPath] = localChecksums[d.RelPath]
-
-		case d.RemoteOnly:
-			// New remote file — download
-			localPath := filepath.Join(prof.Path, d.RelPath)
-			e.logger.Debugf("downloading (new remote): %s", d.RelPath)
-			if err := e.s3.DownloadFile(ctx, prof.Name, d.RelPath, localPath); err != nil {
-				result.Errors = append(result.Errors, fmt.Sprintf("download %s: %v", d.RelPath, err))
-				continue
-			}
-			result.Downloaded++
-			mergedChecksums[d.RelPath] = remoteManifest.FileChecksums[d.RelPath]
-
-		case d.LocalChanged:
-			// Local changed, remote same as baseline — upload
-			entry, ok := localFileMap[d.RelPath]
-			if !ok {
-				continue
-			}
-			e.logger.Debugf("uploading (local changed): %s", d.RelPath)
-			if err := e.s3.UploadFile(ctx, prof.Name, d.RelPath, entry.FullPath); err != nil {
-				result.Errors = append(result.Errors, fmt.Sprintf("upload %s: %v", d.RelPath, err))
-				continue
-			}
-			result.Uploaded++
-			mergedChecksums[d.RelPath] = localChecksums[d.RelPath]
-
-		case d.RemoteChanged:
-			// Remote changed, local same as baseline — download
-			localPath := filepath.Join(prof.Path, d.RelPath)
-			e.logger.Debugf("downloading (remote changed): %s", d.RelPath)
-			if err := e.s3.DownloadFile(ctx, prof.Name, d.RelPath, localPath); err != nil {
-				result.Errors = append(result.Errors, fmt.Sprintf("download %s: %v", d.RelPath, err))
-				continue
-			}
-			result.Downloaded++
-			mergedChecksums[d.RelPath] = remoteManifest.FileChecksums[d.RelPath]
-
-		case d.BothChanged:
-			// Conflict — use resolution choice
-			if conflictChoice == ChoiceKeepLocal {
+		func() {
+			defer e.incrementProgress()
+			switch {
+			case d.LocalOnly:
+				// New local file — upload
 				entry, ok := localFileMap[d.RelPath]
 				if !ok {
-					continue
+					return
 				}
-				e.logger.Debugf("uploading (conflict, keep local): %s", d.RelPath)
+				e.logger.Debugf("uploading (new local): %s", d.RelPath)
 				if err := e.s3.UploadFile(ctx, prof.Name, d.RelPath, entry.FullPath); err != nil {
 					result.Errors = append(result.Errors, fmt.Sprintf("upload %s: %v", d.RelPath, err))
-					continue
+					return
 				}
 				result.Uploaded++
 				mergedChecksums[d.RelPath] = localChecksums[d.RelPath]
-			} else {
+
+			case d.RemoteOnly:
+				// New remote file — download
 				localPath := filepath.Join(prof.Path, d.RelPath)
-				e.logger.Debugf("downloading (conflict, keep remote): %s", d.RelPath)
+				e.logger.Debugf("downloading (new remote): %s", d.RelPath)
 				if err := e.s3.DownloadFile(ctx, prof.Name, d.RelPath, localPath); err != nil {
 					result.Errors = append(result.Errors, fmt.Sprintf("download %s: %v", d.RelPath, err))
-					continue
+					return
 				}
 				result.Downloaded++
 				mergedChecksums[d.RelPath] = remoteManifest.FileChecksums[d.RelPath]
-			}
 
-		case d.LocalDeleted:
-			// File deleted locally, still in remote — remove from remote
-			e.logger.Debugf("deleting from remote (deleted locally): %s", d.RelPath)
-			if err := e.s3.DeleteFile(ctx, prof.Name, d.RelPath); err != nil {
-				result.Errors = append(result.Errors, fmt.Sprintf("delete %s: %v", d.RelPath, err))
-				continue
-			}
-			result.Deleted++
-			delete(mergedChecksums, d.RelPath)
+			case d.LocalChanged:
+				// Local changed, remote same as baseline — upload
+				entry, ok := localFileMap[d.RelPath]
+				if !ok {
+					return
+				}
+				e.logger.Debugf("uploading (local changed): %s", d.RelPath)
+				if err := e.s3.UploadFile(ctx, prof.Name, d.RelPath, entry.FullPath); err != nil {
+					result.Errors = append(result.Errors, fmt.Sprintf("upload %s: %v", d.RelPath, err))
+					return
+				}
+				result.Uploaded++
+				mergedChecksums[d.RelPath] = localChecksums[d.RelPath]
 
-		case d.RemoteDeleted:
-			// File deleted remotely, still locally — remove local
-			localPath := filepath.Join(prof.Path, d.RelPath)
-			e.logger.Debugf("deleting local (deleted remotely): %s", d.RelPath)
-			if err := os.Remove(localPath); err != nil && !os.IsNotExist(err) {
-				result.Errors = append(result.Errors, fmt.Sprintf("local delete %s: %v", d.RelPath, err))
-				continue
+			case d.RemoteChanged:
+				// Remote changed, local same as baseline — download
+				localPath := filepath.Join(prof.Path, d.RelPath)
+				e.logger.Debugf("downloading (remote changed): %s", d.RelPath)
+				if err := e.s3.DownloadFile(ctx, prof.Name, d.RelPath, localPath); err != nil {
+					result.Errors = append(result.Errors, fmt.Sprintf("download %s: %v", d.RelPath, err))
+					return
+				}
+				result.Downloaded++
+				mergedChecksums[d.RelPath] = remoteManifest.FileChecksums[d.RelPath]
+
+			case d.BothChanged:
+				// Conflict — use resolution choice
+				if conflictChoice == ChoiceKeepLocal {
+					entry, ok := localFileMap[d.RelPath]
+					if !ok {
+						return
+					}
+					e.logger.Debugf("uploading (conflict, keep local): %s", d.RelPath)
+					if err := e.s3.UploadFile(ctx, prof.Name, d.RelPath, entry.FullPath); err != nil {
+						result.Errors = append(result.Errors, fmt.Sprintf("upload %s: %v", d.RelPath, err))
+						return
+					}
+					result.Uploaded++
+					mergedChecksums[d.RelPath] = localChecksums[d.RelPath]
+				} else {
+					localPath := filepath.Join(prof.Path, d.RelPath)
+					e.logger.Debugf("downloading (conflict, keep remote): %s", d.RelPath)
+					if err := e.s3.DownloadFile(ctx, prof.Name, d.RelPath, localPath); err != nil {
+						result.Errors = append(result.Errors, fmt.Sprintf("download %s: %v", d.RelPath, err))
+						return
+					}
+					result.Downloaded++
+					mergedChecksums[d.RelPath] = remoteManifest.FileChecksums[d.RelPath]
+				}
+
+			case d.LocalDeleted:
+				// File deleted locally, still in remote — remove from remote
+				e.logger.Debugf("deleting from remote (deleted locally): %s", d.RelPath)
+				if err := e.s3.DeleteFile(ctx, prof.Name, d.RelPath); err != nil {
+					result.Errors = append(result.Errors, fmt.Sprintf("delete %s: %v", d.RelPath, err))
+					return
+				}
+				result.Deleted++
+				delete(mergedChecksums, d.RelPath)
+
+			case d.RemoteDeleted:
+				// File deleted remotely, still locally — remove local
+				localPath := filepath.Join(prof.Path, d.RelPath)
+				e.logger.Debugf("deleting local (deleted remotely): %s", d.RelPath)
+				if err := os.Remove(localPath); err != nil && !os.IsNotExist(err) {
+					result.Errors = append(result.Errors, fmt.Sprintf("local delete %s: %v", d.RelPath, err))
+					return
+				}
+				result.Deleted++
+				delete(mergedChecksums, d.RelPath)
 			}
-			result.Deleted++
-			delete(mergedChecksums, d.RelPath)
-		}
+		}()
 	}
+	e.finishProgress()
 
 	// Step 6: Update remote manifest
 	now := time.Now().UTC()
@@ -392,19 +422,24 @@ func (e *Engine) RestoreProfile(ctx context.Context, prof profile.Profile) (*Syn
 		return nil, fmt.Errorf("no remote data found for profile %s", prof.Name)
 	}
 
+	e.startProgress("Restoring", len(manifest.FileChecksums))
 	for relPath := range manifest.FileChecksums {
 		if !profile.IsAllowed(relPath) {
 			result.Skipped++
+			e.incrementProgress()
 			continue
 		}
 		localPath := filepath.Join(prof.Path, relPath)
 		e.logger.Debugf("restoring: %s", relPath)
 		if err := e.s3.DownloadFile(ctx, prof.Name, relPath, localPath); err != nil {
 			result.Errors = append(result.Errors, fmt.Sprintf("restore %s: %v", relPath, err))
+			e.incrementProgress()
 			continue
 		}
 		result.Downloaded++
+		e.incrementProgress()
 	}
+	e.finishProgress()
 
 	deviceID, _ := config.GetDeviceID()
 	now := time.Now().UTC()
@@ -433,14 +468,18 @@ func (e *Engine) GetRemoteProfiles(ctx context.Context) ([]string, error) {
 func (e *Engine) initialUpload(ctx context.Context, prof profile.Profile, files []profile.FileEntry, checksums map[string]string, deviceID string) (*SyncResult, error) {
 	result := &SyncResult{ProfileName: prof.Name}
 
+	e.startProgress("Uploading", len(files))
 	for _, f := range files {
 		e.logger.Debugf("uploading (initial): %s", f.RelPath)
 		if err := e.s3.UploadFile(ctx, prof.Name, f.RelPath, f.FullPath); err != nil {
 			result.Errors = append(result.Errors, fmt.Sprintf("upload %s: %v", f.RelPath, err))
+			e.incrementProgress()
 			continue
 		}
 		result.Uploaded++
+		e.incrementProgress()
 	}
+	e.finishProgress()
 
 	now := time.Now().UTC()
 	manifest := &s3client.Manifest{
