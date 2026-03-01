@@ -7,9 +7,9 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/helium-sync/helium-sync/internal/config"
-	"github.com/helium-sync/helium-sync/internal/profile"
-	hsync "github.com/helium-sync/helium-sync/internal/sync"
+	"github.com/stonespren/helium-sync/internal/config"
+	"github.com/stonespren/helium-sync/internal/profile"
+	hsync "github.com/stonespren/helium-sync/internal/sync"
 )
 
 func newSyncCmd() *cobra.Command {

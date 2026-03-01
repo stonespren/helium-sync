@@ -9,7 +9,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/helium-sync/helium-sync/internal/config"
+	"github.com/stonespren/helium-sync/internal/config"
 )
 
 type Level int

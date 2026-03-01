@@ -1,4 +1,4 @@
-module github.com/helium-sync/helium-sync
+module github.com/stonespren/helium-sync
 
 go 1.25.0
 

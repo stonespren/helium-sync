@@ -6,7 +6,7 @@ import (
 
 	"github.com/spf13/cobra"
 
-	hsync "github.com/helium-sync/helium-sync/internal/sync"
+	hsync "github.com/stonespren/helium-sync/internal/sync"
 )
 
 func newLogsCmd() *cobra.Command {

@@ -12,9 +12,9 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/helium-sync/helium-sync/internal/config"
-	"github.com/helium-sync/helium-sync/internal/profile"
-	s3client "github.com/helium-sync/helium-sync/internal/s3"
+	"github.com/stonespren/helium-sync/internal/config"
+	"github.com/stonespren/helium-sync/internal/profile"
+	s3client "github.com/stonespren/helium-sync/internal/s3"
 )
 
 const (

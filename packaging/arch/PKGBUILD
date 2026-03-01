@@ -1,10 +1,10 @@
-# Maintainer: helium-sync maintainers
+# Maintainer: stonespren
 pkgname=helium-sync
 pkgver=0.1.0
 pkgrel=1
 pkgdesc="Synchronize Helium browser profile data across devices using Amazon S3"
 arch=('x86_64')
-url="https://github.com/helium-sync/helium-sync"
+url="https://github.com/stonespren/helium-sync"
 license=('MIT')
 depends=()
 makedepends=('go')

@@ -15,7 +15,7 @@ helium-sync copies a strict subset of Helium browser profile data to and from an
 ### Arch Linux (AUR)
 
 ```
-git clone https://github.com/helium-sync/helium-sync.git
+git clone https://github.com/stonespren/helium-sync.git
 cd helium-sync/packaging/arch
 makepkg -si
 ```
@@ -25,7 +25,7 @@ makepkg -si
 Requirements: Go 1.21+, AWS CLI v2
 
 ```
-git clone https://github.com/helium-sync/helium-sync.git
+git clone https://github.com/stonespren/helium-sync.git
 cd helium-sync
 CGO_ENABLED=0 go build -o helium-sync ./cmd/helium-sync/
 sudo install -Dm755 helium-sync /usr/bin/helium-sync

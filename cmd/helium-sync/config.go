@@ -8,7 +8,7 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/helium-sync/helium-sync/internal/config"
+	"github.com/stonespren/helium-sync/internal/config"
 )
 
 func newConfigCmd() *cobra.Command {
