@@ -97,6 +97,89 @@ prompt() {
     fi
 }
 
+# Interactive selector with arrow keys and j/k navigation
+# Usage: interactive_select RESULT_VAR "prompt" option1 option2 ...
+interactive_select() {
+    local _result_var="$1"
+    local _prompt="$2"
+    shift 2
+    local -a _options=("$@")
+    local _count=${#_options[@]}
+    local _selected=0
+
+    if [[ ${_count} -eq 0 ]]; then
+        log_error "No options provided to selector."
+        return 1
+    fi
+
+    # If only one option, auto-select
+    if [[ ${_count} -eq 1 ]]; then
+        eval "${_result_var}=0"
+        return 0
+    fi
+
+    echo -e "${BLUE}?${NC} ${_prompt}"
+    echo -e "  ${YELLOW}Use ↑/↓ or k/j to move, Enter to select${NC}"
+    echo
+
+    # Hide cursor
+    tput civis 2>/dev/null || true
+
+    # Render function
+    _render_options() {
+        # Move up to overwrite previous render (skip on first render)
+        if [[ ${1:-0} -eq 1 ]]; then
+            for (( i=0; i<_count; i++ )); do
+                tput cuu1 2>/dev/null
+                tput el 2>/dev/null
+            done
+        fi
+        for (( i=0; i<_count; i++ )); do
+            if [[ ${i} -eq ${_selected} ]]; then
+                echo -e "  ${GREEN}❯ ${_options[${i}]}${NC}"
+            else
+                echo -e "    ${_options[${i}]}"
+            fi
+        done
+    }
+
+    _render_options 0
+
+    while true; do
+        # Read a single character (raw mode)
+        IFS= read -rsn1 key
+        case "${key}" in
+            $'\x1b')  # Escape sequence (arrow keys)
+                read -rsn2 -t 0.1 seq || true
+                case "${seq}" in
+                    '[A') # Up arrow
+                        if (( _selected > 0 )); then _selected=$((_selected - 1)); fi
+                        ;;
+                    '[B') # Down arrow
+                        if (( _selected < _count - 1 )); then _selected=$((_selected + 1)); fi
+                        ;;
+                esac
+                ;;
+            'k'|'K')  # Vim up
+                if (( _selected > 0 )); then _selected=$((_selected - 1)); fi
+                ;;
+            'j'|'J')  # Vim down
+                if (( _selected < _count - 1 )); then _selected=$((_selected + 1)); fi
+                ;;
+            '')  # Enter
+                break
+                ;;
+        esac
+        _render_options 1
+    done
+
+    # Show cursor
+    tput cnorm 2>/dev/null || true
+    echo
+
+    eval "${_result_var}=${_selected}"
+}
+
 confirm() {
     local prompt_text="$1"
     local default="${2:-n}"
@@ -239,69 +322,71 @@ log_step "Configuring AWS credentials..."
 _PRELOADED_AWS_PROFILE="${AWS_PROFILE_NAME:-}"
 _PRELOADED_AWS_REGION="${AWS_REGION:-}"
 
-if [[ -n "${_PRELOADED_AWS_PROFILE}" ]]; then
-    AWS_PROFILE_NAME="${_PRELOADED_AWS_PROFILE}"
-    log_info "Using AWS profile from config: ${AWS_PROFILE_NAME}"
-elif [[ -f "${HOME}/.aws/credentials" ]]; then
-    log_info "Found existing AWS credentials."
-
-    # List available profiles
-    PROFILES=$(aws configure list-profiles 2>/dev/null || echo "default")
-    PROFILE_ARRAY=()
-    while IFS= read -r line; do
-        [[ -n "${line}" ]] && PROFILE_ARRAY+=("${line}")
-    done <<< "${PROFILES}"
-
-    if [[ ${#PROFILE_ARRAY[@]} -gt 1 ]]; then
-        if [[ "${NON_INTERACTIVE}" == "false" ]]; then
-            echo "Available AWS profiles:"
-            for i in "${!PROFILE_ARRAY[@]}"; do
-                echo "  $((i + 1))) ${PROFILE_ARRAY[${i}]}"
-            done
-            prompt PROFILE_IDX "Select AWS profile number" "1"
-            IDX=$((PROFILE_IDX - 1))
-            if [[ ${IDX} -ge 0 && ${IDX} -lt ${#PROFILE_ARRAY[@]} ]]; then
-                AWS_PROFILE_NAME="${PROFILE_ARRAY[${IDX}]}"
-            else
-                AWS_PROFILE_NAME="default"
-            fi
-        else
-            AWS_PROFILE_NAME="default"
-        fi
+# Helper: prompt for new AWS credentials and save them
+_add_new_aws_credentials() {
+    prompt AWS_ACCESS_KEY "AWS Access Key ID"
+    if [[ "${NON_INTERACTIVE}" == "false" ]]; then
+        read -rsp "$(echo -e "${BLUE}?${NC}") AWS Secret Access Key: " AWS_SECRET_KEY
+        echo
     else
-        AWS_PROFILE_NAME="${PROFILE_ARRAY[0]:-default}"
+        log_error "Cannot prompt for secret key in non-interactive mode."
+        exit 1
     fi
-    log_info "Using AWS profile: ${AWS_PROFILE_NAME}"
-else
-    log_warn "No AWS credentials found."
-    if confirm "Would you like to configure AWS credentials now?" "y"; then
-        prompt AWS_ACCESS_KEY "AWS Access Key ID"
-        # Read secret key without echoing
-        if [[ "${NON_INTERACTIVE}" == "false" ]]; then
-            read -rsp "$(echo -e "${BLUE}?${NC}") AWS Secret Access Key: " AWS_SECRET_KEY
-            echo
-        else
-            log_error "Cannot prompt for secret key in non-interactive mode."
-            exit 1
-        fi
-        prompt AWS_PROFILE_NAME "AWS profile name" "default"
+    prompt AWS_PROFILE_NAME "AWS profile name" "default"
 
-        mkdir -p "${HOME}/.aws"
-        chmod 700 "${HOME}/.aws"
+    mkdir -p "${HOME}/.aws"
+    chmod 700 "${HOME}/.aws"
 
-        # Append profile to credentials
-        cat >> "${HOME}/.aws/credentials" <<CRED
+    # Append profile to credentials
+    cat >> "${HOME}/.aws/credentials" <<CRED
 
 [${AWS_PROFILE_NAME}]
 aws_access_key_id = ${AWS_ACCESS_KEY}
 aws_secret_access_key = ${AWS_SECRET_KEY}
 CRED
-        chmod 600 "${HOME}/.aws/credentials"
-        log_info "AWS credentials saved."
-    else
-        log_error "AWS credentials are required. Aborting."
-        exit 1
+    chmod 600 "${HOME}/.aws/credentials"
+    log_info "AWS credentials saved."
+}
+
+if [[ -n "${_PRELOADED_AWS_PROFILE}" ]]; then
+    AWS_PROFILE_NAME="${_PRELOADED_AWS_PROFILE}"
+    log_info "Using AWS profile from config: ${AWS_PROFILE_NAME}"
+else
+    # Gather existing profiles (if any)
+    PROFILE_ARRAY=()
+    if [[ -f "${HOME}/.aws/credentials" ]]; then
+        PROFILES=$(aws configure list-profiles 2>/dev/null || echo "")
+        while IFS= read -r line; do
+            [[ -n "${line}" ]] && PROFILE_ARRAY+=("${line}")
+        done <<< "${PROFILES}"
     fi
+
+    if [[ "${NON_INTERACTIVE}" == "true" ]]; then
+        # Non-interactive: use first existing profile or fail
+        if [[ ${#PROFILE_ARRAY[@]} -gt 0 ]]; then
+            AWS_PROFILE_NAME="${PROFILE_ARRAY[0]}"
+        else
+            log_error "No AWS credentials found and running non-interactive. Aborting."
+            exit 1
+        fi
+    else
+        # Build menu options: existing profiles + "Add new credentials"
+        MENU_OPTIONS=()
+        for p in "${PROFILE_ARRAY[@]}"; do
+            MENU_OPTIONS+=("${p}")
+        done
+        MENU_OPTIONS+=("Add new credentials")
+
+        interactive_select CRED_IDX "Select AWS credentials" "${MENU_OPTIONS[@]}"
+
+        if [[ ${CRED_IDX} -eq $((${#MENU_OPTIONS[@]} - 1)) ]]; then
+            # User chose "Add new credentials"
+            _add_new_aws_credentials
+        else
+            AWS_PROFILE_NAME="${PROFILE_ARRAY[${CRED_IDX}]}"
+        fi
+    fi
+    log_info "Using AWS profile: ${AWS_PROFILE_NAME}"
 fi
 
 # ============================================================
