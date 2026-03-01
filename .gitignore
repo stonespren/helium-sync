@@ -1,0 +1,26 @@
+# Build output
+helium-sync
+*.exe
+
+# Go
+vendor/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Packaging artifacts
+packaging/arch/pkg/
+packaging/arch/src/
+packaging/arch/*.tar.*
+packaging/arch/*.pkg.tar.*
+
+# Logs and state (local runtime)
+*.log
